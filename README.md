@@ -2,9 +2,10 @@
 
 A relocatable, self-contained Python runtime -- the interpreter itself
 (musl, [python-build-standalone](https://github.com/astral-sh/python-build-standalone)
-via `uv`), its trimmed stdlib, and worker.py's own dial-out dependencies
-(`h2`/`hpack`/`hyperframe`/`tlslite-ng`/`cryptography`) -- packaged as a
-single `runtime.tar.gz`. Built and published from here so that
+via `uv`), its trimmed stdlib, worker.py's own dial-out dependencies
+(`h2`/`hpack`/`hyperframe`/`tlslite-ng`/`cryptography`), and `worker.py`/
+`storage.py` themselves -- packaged as a single `runtime.tar.gz`. Built
+and published from here so that
 [aci-worker](https://github.com/directionallyai/aci-worker)'s own image
 no longer needs any of this baked in: that image now only carries
 `session_master` + `bubblewrap` + the bare OS underneath them, and this
@@ -14,17 +15,25 @@ fetch-verify-extract-and-bind mechanism `session_master.rs`'s own
 itself out of the CCE-measured trusted computing base, not just the
 application code that runs on top of it.
 
-## What's NOT in here
+## Why worker.py/storage.py are committed here, in the open
 
-`worker.py`/`storage.py` themselves -- those stay backend's own
-canonical, human-reviewed source (a separate, private repo), and change
-far more often than an interpreter/dependency pin should. Instead of a
-second bundle layered on top at request time, backend's own publish step
-takes exactly the tarball this repo produces, extracts it, drops
-`worker.py`/`storage.py` straight into `lib/python3.12/site-packages/`
-(already on `sys.path`, no `PYTHONPATH` wiring needed), re-tars the
-combined result, and publishes *that* single artifact by its own content
-hash. One fetch per session, not two.
+They're inseparable parts of what actually runs, not a user-selectable
+or user-tunable payload -- the trust boundary this whole system rests on
+is "which exact `worker_bundle` hash is running," verified via MAA/CCE
+attestation plus the content hash itself, not "keep the workload source
+private." Committing them here instead of layering them in from a
+private repo at publish time keeps that boundary honest: a third party
+checking `ACI_WORKER_BUNDLE_SHA256` against a real, running attested
+container can actually read what they're trusting, the same reasoning
+that already applies to `aci-worker`'s own `session_master.rs` being
+public.
+
+Canonical source still lives in backend's own
+`packages/api/assets/setup/{worker,storage}.py` too (a separate,
+private repo -- local dev/test there still imports from that copy) --
+keeping the two in sync is a real, known cost (worker.py diverged badly
+once already between two repos earlier in this project's history) and
+is open follow-up work, not something this repo solves on its own yet.
 
 ## `runtime`
 
@@ -42,11 +51,13 @@ exec "$here/bin/python3.12" -c "import worker; worker.main()"
 
 Extract the tarball anywhere (a fresh, hash-named `/tmp` directory
 picked at session start, never a fixed location) and run `./runtime` --
-no environment variables, no flags. This repo's own build never carries
-`worker.py`, so its own verify stage confirms the *other* half: that
-`runtime` correctly reaches Python and fails specifically on
-`ModuleNotFoundError: No module named 'worker'`, both as root and as the
-unprivileged uid (10001) `worker.py` itself always runs as inside
+no environment variables, no flags, no `PYTHONPATH`. The build's own
+verify stage pipes empty stdin into a real build of this tarball and
+checks for `worker.py`'s own `json.decoder.JSONDecodeError` (from
+`main()`'s `json.loads(sys.stdin.read())`) -- proof the whole chain
+(`runtime`'s exec, `worker.py`'s import, which pulls in `storage.py`
+alongside it, and `worker.main()` itself) genuinely runs, both as root
+and as the unprivileged uid (10001) `worker.py` always runs as inside
 `session_master.rs`'s bwrap sandbox.
 
 ## Why tar.gz, not a mountable image
@@ -106,7 +117,8 @@ Published to GHCR as `ghcr.io/directionallyai/worker-python-runtime/worker-pytho
 a distribution-only image (`busybox:1.37.0-musl` + one file,
 `/runtime.tar.gz`) -- pullers need retrieve one known file, not the
 builder image, package indexes, or the verify stage's own extracted
-tree. Backend's own publish step pulls it, extracts `/runtime.tar.gz`,
-layers in `worker.py`/`storage.py`, and republishes the combined result
-by content hash the same way it already does for the reviewer bundle
-(`ensure_worker_bundle()`, `packages/api/src/main.rs`).
+tree. Backend's own publish step (`ensure_worker_bundle()`-shaped,
+`packages/api/src/main.rs`, a separate private repo) pulls this image,
+extracts `/runtime.tar.gz`, and republishes it to CAS by its own content
+hash -- unchanged from that file's own copy, no repackaging step needed
+now that `worker.py`/`storage.py` already live inside it.

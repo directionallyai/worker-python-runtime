@@ -1,31 +1,32 @@
 # Builds a relocatable, self-contained Python runtime -- the interpreter
-# itself, its stdlib (trimmed), and worker.py's own dial-out dependencies
-# (h2/hpack/hyperframe/tlslite-ng/cryptography) -- as a single tar.gz,
-# never baked into aci-worker's own image. That image now only needs to
-# carry session_master + bubblewrap + the bare OS underneath them; this
-# tarball is fetched fresh by content hash at session start
-# (fetch_worker_bundle()-shaped: verify SHA-256, extract to /tmp, bind
-# into the bwrap sandbox), same mechanism the old worker_bundle zip
-# already used. Moving the interpreter+deps here too gets Python itself
-# out of the CCE-measured TCB, not just the application code sitting on
-# top of it.
+# itself, its stdlib (trimmed), worker.py's own dial-out dependencies
+# (h2/hpack/hyperframe/tlslite-ng/cryptography), and worker.py/storage.py
+# themselves -- as a single tar.gz, never baked into aci-worker's own
+# image. That image now only needs to carry session_master + bubblewrap
+# + the bare OS underneath them; this tarball is fetched fresh by
+# content hash at session start (fetch_worker_bundle()-shaped: verify
+# SHA-256, extract to /tmp, bind into the bwrap sandbox). Moving the
+# interpreter+deps here too gets Python itself out of the CCE-measured
+# TCB, not just the application code sitting on top of it.
 #
-# worker.py/storage.py themselves are NOT part of this repo or this
-# tarball -- they stay backend's own canonical, human-reviewed source
-# (a separate, private repo), which changes far more often than an
-# interpreter/dependency pin should. Instead of a second, separately
-# fetched worker_bundle zip layered on top at PYTHONPATH (the earlier
-# design), backend's own publish step takes exactly this tarball,
-# extracts it, drops worker.py/storage.py straight into
-# lib/python3.12/site-packages/ (already on sys.path, no PYTHONPATH
-# wiring needed), re-tars the combined result, and publishes *that*
-# single artifact by its own content hash -- one fetch per session
-# instead of two. This repo's own build has no access to worker.py/
-# storage.py at all and isn't meant to: `runtime` below is written to
-# work correctly whether or not they're present, and this repo's verify
-# stage below confirms exactly that (it fails to `import worker`, on
-# purpose -- proving the exec chain is right, not that the payload is
-# complete).
+# worker.py/storage.py ARE committed here, as real source, not fetched
+# or layered in by a separate downstream publish step (an earlier
+# revision of this Dockerfile tried that split -- runtime here,
+# worker.py/storage.py added afterward by backend -- and abandoned it).
+# They're inseparable parts of what actually runs, not a
+# user-selectable/tunable payload: the trust boundary this whole system
+# rests on is "which exact worker_bundle hash is running," verified via
+# MAA/CCE attestation plus the hash itself, not "keep the workload
+# source private." Committing them here instead keeps that boundary
+# honest -- a third party checking `ACI_WORKER_BUNDLE_SHA256` against
+# real, running code can actually read what they're trusting, the same
+# reasoning that already applies to aci-worker's own session_master.rs
+# being public. Canonical source stays backend's own
+# packages/api/assets/setup/{worker,storage}.py for now (local dev/test
+# still imports them from there) -- keeping the two copies in sync is a
+# known, real cost (worker.py diverged badly once already this session
+# when it lived in two places) and is flagged as follow-up work, not
+# solved by this commit.
 #
 # An EROFS image (mount instead of extract) was tried first and
 # abandoned: mounting one needs CAP_SYS_ADMIN (a real loop mount) or
@@ -121,6 +122,11 @@ RUN /build/runtime/bin/python3.12 -m pip install --no-cache-dir \
     && find /build/runtime -name "*.dist-info" -exec rm -rf {} + \
     && rm -rf /build/runtime/lib/python3.12/site-packages/pip*
 
+# worker.py imports storage.py directly (`import storage`) -- both have
+# to land in the same importable location, already on sys.path, no
+# PYTHONPATH wiring needed by session_master.rs's own run_worker().
+COPY worker.py storage.py /build/runtime/lib/python3.12/site-packages/
+
 # The one stable entry point session_master.rs's own run_worker() execs
 # -- a script, not a bare symlink to bin/python3.12, so callers never
 # need to know this tree's own internal layout or the exact `-c` form
@@ -153,22 +159,23 @@ RUN mkdir -p /extracted \
     && /extracted/runtime/bin/python3.12 -c "import h2, hpack, hyperframe, tlslite, cryptography; print('deps import OK')" \
     && /extracted/runtime/bin/python3.12 -c "from cryptography.hazmat.primitives.ciphers.aead import AESGCM; import os; k=AESGCM.generate_key(256); a=AESGCM(k); n=os.urandom(12); ct=a.encrypt(n, b'hi', None); assert a.decrypt(n, ct, None) == b'hi'; print('AESGCM roundtrip OK')" \
     && /extracted/runtime/bin/python3.12 -c "import h2.connection; c = h2.connection.H2Connection(); c.initiate_connection(); print('h2 connection OK')"
-# `runtime` itself, run as-is: this repo never carries worker.py, so the
-# only correct outcome is the script reaching Python and failing on the
-# `import worker` line specifically -- anything else (a shell error, a
-# different traceback, an exit before Python even starts) means the
-# entry point itself is broken, not just missing its payload.
-RUN output="$(/extracted/runtime/runtime 2>&1)"; ec=$?; echo "$output" \
+# `runtime` itself, with worker.py's own real main() behind it now:
+# main() does `json.loads(sys.stdin.read())` before anything else (see
+# worker.py), so piping empty stdin is a deterministic way to prove the
+# whole chain -- runtime's own exec, worker.py's import (which pulls in
+# storage.py alongside it), and worker.main() itself actually running --
+# without needing a real storage_grant/content key to exercise here.
+RUN output="$(echo -n '' | /extracted/runtime/runtime 2>&1)"; ec=$?; echo "$output" \
     && [ "$ec" -ne 0 ] \
-    && echo "$output" | grep -q "ModuleNotFoundError: No module named 'worker'" \
-    && echo "runtime entry point OK (correctly failed on missing worker.py)"
+    && echo "$output" | grep -q "json.decoder.JSONDecodeError" \
+    && echo "runtime entry point OK (worker.main() reached real stdin parsing)"
 RUN addgroup -S -g 10001 worker \
     && adduser -S -D -H -s /sbin/nologin -u 10001 -G worker worker
 USER 10001:10001
 RUN /extracted/runtime/bin/python3.12 -c "print('unprivileged run OK')" \
-    && output="$(/extracted/runtime/runtime 2>&1)"; ec=$?; echo "$output" \
+    && output="$(echo -n '' | /extracted/runtime/runtime 2>&1)"; ec=$?; echo "$output" \
     && [ "$ec" -ne 0 ] \
-    && echo "$output" | grep -q "ModuleNotFoundError: No module named 'worker'" \
+    && echo "$output" | grep -q "json.decoder.JSONDecodeError" \
     && echo "runtime entry point OK as unprivileged uid too"
 
 # ---------------------------------------------------------------------------
