@@ -105,11 +105,20 @@ what makes the `python-build-standalone` resolution reproducible: a
 given `uv` release embeds a fixed mapping from a version string like
 `cpython-3.12.14-linux-x86_64-musl` to one specific
 `python-build-standalone` release tag, so pinning `uv` pins that
-resolution too. `PYTHON_SPEC`'s own patch version, and the five pinned
-wheel versions, still need bumping by hand, deliberately -- same
-"human-reviewed pin, not fetched trust" posture as `agent.py`'s own
-`AZURE_MAA_EXPECTED_ISSUER`/`ACI_WORKER_BUNDLE_SHA256` (backend, a
-separate, private repo).
+resolution too. `PYTHON_SPEC`'s own patch version still needs bumping by
+hand, deliberately -- same "human-reviewed pin, not fetched trust"
+posture as `agent.py`'s own `AZURE_MAA_EXPECTED_ISSUER`/
+`ACI_WORKER_BUNDLE_SHA256` (backend, a separate, private repo).
+
+The five direct dependency versions in `pyproject.toml` are pinned by
+hand the same way, but `uv.lock` is what actually pins the *transitive*
+ones too (`cffi`/`ecdsa`/`pycparser`/`six`) -- listing only the five
+direct versions in the Dockerfile itself, as an earlier revision did,
+left those four floating to whatever was latest-compatible at build
+time. `uv lock` regenerates it; `uv export --frozen --no-hashes
+--no-emit-project` is what the Dockerfile itself uses to turn the lock
+into a plain `requirements.txt`, installed with `pip install --no-deps`
+so nothing gets resolved a second time at install.
 
 ## Distribution
 

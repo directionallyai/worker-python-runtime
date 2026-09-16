@@ -111,13 +111,21 @@ RUN rm -rf \
 # this musl builder -- confirmed the hard way that pip refuses a
 # musllinux-tagged wheel from a glibc host without forcing the platform
 # tags, which building natively here avoids needing at all.
-RUN /build/runtime/bin/python3.12 -m pip install --no-cache-dir \
+#
+# `uv export` resolves pyproject.toml's own 5 direct pins against
+# uv.lock -- the lock is what actually pins the transitive dependencies
+# too (cffi/ecdsa/pycparser/six), which listing only the five direct
+# versions by hand never did. `--no-deps` on the install itself is
+# deliberate belt-and-suspenders: every version is already fully
+# resolved by the lock, so pip is never allowed to resolve anything on
+# its own at install time, on this or any future rebuild.
+COPY pyproject.toml uv.lock /tmp/lockfile/
+RUN uv export --project /tmp/lockfile --frozen --no-hashes --no-emit-project \
+      -o /tmp/requirements.txt \
+    && /build/runtime/bin/python3.12 -m pip install --no-cache-dir --no-deps \
       --target /build/runtime/lib/python3.12/site-packages \
-      hyperframe==6.1.0 \
-      hpack==4.2.0 \
-      h2==4.4.1 \
-      tlslite-ng==0.8.2 \
-      cryptography==50.0.1 \
+      -r /tmp/requirements.txt \
+    && rm -rf /tmp/lockfile /tmp/requirements.txt \
     && find /build/runtime -name "__pycache__" -type d -exec rm -rf {} + \
     && find /build/runtime -name "*.dist-info" -exec rm -rf {} + \
     && rm -rf /build/runtime/lib/python3.12/site-packages/pip*

@@ -1,0 +1,12 @@
+[project]
+name = "worker-python-runtime"
+version = "0.1.0"
+description = "Dependency lock for worker-python-runtime's own site-packages -- not an installable package itself. See Dockerfile/README for how this is actually used (uv export -> pip install --target, never `uv run`/`uv sync` against this project)."
+requires-python = "==3.12.*"
+dependencies = [
+    "hyperframe==6.1.0",
+    "hpack==4.2.0",
+    "h2==4.4.1",
+    "tlslite-ng==0.8.2",
+    "cryptography==50.0.1",
+]
