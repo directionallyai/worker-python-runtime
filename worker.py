@@ -96,6 +96,7 @@ import os
 import socket
 import struct
 import sys
+import time
 import traceback
 
 
@@ -732,7 +733,29 @@ def handle(request):
     """Pure-ish: takes a parsed request, returns a response dict. No stdin/
     stdout here -- kept separate from main() so it's callable from a test
     without piping JSON through real file descriptors.
+
+    `request["profile"]` (bool, absent/false by default): times this
+    function's own major phases and returns them as response["timings"],
+    {phase_name: seconds}, in the order they ran. Exists because
+    session_master.rs's own execution_duration_ms already brackets this
+    entire call from outside, as one undifferentiated number -- confirmed
+    live to run ~1.1-1.6s for even a trivial eval, dominated by something
+    other than interpreter/import cost, with no way to tell which phase
+    from that single number alone. Zero cost when absent: `_mark()` below
+    doesn't call time.perf_counter() at all unless profile is set.
     """
+    profile = bool(request.get("profile"))
+    timings = {} if profile else None
+    phase_start = time.perf_counter() if profile else None
+
+    def _mark(name):
+        nonlocal phase_start
+        if not profile:
+            return
+        now = time.perf_counter()
+        timings[name] = now - phase_start
+        phase_start = now
+
     # queue_token/queue_addr are injected by session_master.rs's own
     # run_callback_session() before this process is even spawned -- not
     # part of worker.py's documented request shape, since ordinary
@@ -759,6 +782,7 @@ def handle(request):
         request.get("pattern_delegate"),
         request.get("content_keys") or [],
     )
+    _mark("make_queue_eval")
 
     # Built before World for the same reason queue_eval is -- so it can
     # be handed to World's own constructor below and reach `World`'s own
@@ -773,6 +797,7 @@ def handle(request):
         request.get("callback_id"),
         request.get("aes_key"),
     )
+    _mark("make_local_callback")
 
     # "worldless": request.get("world") defaults to True (the ordinary
     # path) -- explicitly False skips storage.py/Bucket/load_world_module()/
@@ -803,7 +828,9 @@ def handle(request):
         bucket, kv = build_bucket_and_kv(
             request["storage_grant"], request.get("content_keys") or []
         )
+        _mark("build_bucket_and_kv")
         world_module = load_world_module(bucket)
+        _mark("load_world_module")
         # agent.py's _issue_delegation_for_call() mints a fresh, short-lived
         # pattern:query delegate for every eval/repl call and sends it here
         # alongside storage_grant, purely as part of this one request -- never
@@ -817,12 +844,14 @@ def handle(request):
         world = world_module.World(
             kv, str(request.get("pattern_delegate") or "").strip(), queue_eval=queue_eval, local=local
         )
+        _mark("build_world")
         scope_vars = {"world": world}
     else:
         scope_vars = {
             "storage_grant": request["storage_grant"],
             "content_keys": request.get("content_keys") or [],
         }
+        _mark("worldless_setup")
 
     # Also added directly to scope_vars (not only reachable via
     # `world`/World's own internals above) -- top-level submitted code
@@ -848,7 +877,10 @@ def handle(request):
         # debugged, so there is nothing here to redact.
         response["ok"] = False
         response["error"] = traceback.format_exc()
+    _mark("run")
     response["stdout"] = captured.getvalue()
+    if profile:
+        response["timings"] = timings
     return response
 
 
