@@ -20,13 +20,9 @@
 # source private." Committing them here instead keeps that boundary
 # honest -- a third party checking `ACI_WORKER_BUNDLE_SHA256` against
 # real, running code can actually read what they're trusting, the same
-# reasoning that already applies to aci-worker's own session_master.rs
-# being public. Canonical source stays backend's own
-# packages/api/assets/setup/{worker,storage}.py for now (local dev/test
-# still imports them from there) -- keeping the two copies in sync is a
-# known, real cost (worker.py diverged badly once already this session
-# when it lived in two places) and is flagged as follow-up work, not
-# solved by this commit.
+# reasoning that already applies to aci-worker's own session_master.rs being
+# public. This repository is now the sole source; downstream images copy the
+# reviewed files from this distribution image.
 #
 # An EROFS image (mount instead of extract) was tried first and
 # abandoned: mounting one needs CAP_SYS_ADMIN (a real loop mount) or

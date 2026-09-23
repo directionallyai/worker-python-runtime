@@ -89,6 +89,7 @@ import ast
 import base64
 import contextlib
 import datetime
+import hashlib
 import importlib.util
 import io
 import json
@@ -118,21 +119,56 @@ def load_module(name, filename):
 
 
 def load_module_from_source(name, source):
-    """Same result as load_module(), for a body that did not come from a
-    file beside this script -- the live-repointed world.py fetched below.
-    """
+    """Load content-addressed Python and expose it to later imports."""
     spec = importlib.util.spec_from_loader(name, loader=None)
     module = importlib.util.module_from_spec(spec)
-    exec(compile(source, f"<{name}:live>", "exec"), module.__dict__)
+    sys.modules[name] = module
+    try:
+        exec(compile(source, f"<{name}:live>", "exec"), module.__dict__)
+    except Exception:
+        sys.modules.pop(name, None)
+        raise
     return module
 
 
 # Matches circle.py's own WORLD_PY_POINTER_KEY -- a plain KV key, resolved
 # through bucket.kv_get() the same as any other per-account key (own_prefix
 # + "kv/" + this name). Deliberately NOT under a shared/global prefix: each
-# account's world.py is its own, the same way its suggestions log already
-# is, not one pointer every account resolves the same way.
+# account's world.py is its own, not one pointer every account resolves the
+# same way.
 WORLD_PY_POINTER_KEY = "circle.world_py"
+WORLD_CORE_POINTER_KEY = "circle.world_core"
+WORLD_CORE_SHARED_KEY = "world_core"
+
+
+def _sha256_pointer(value, label):
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", "replace")
+    digest = str(value or "").strip().lower()
+    if len(digest) != 64 or not all(c in "0123456789abcdef" for c in digest):
+        raise RuntimeError(f"{label} is not a valid sha256 pointer: {value!r}")
+    return digest
+
+
+def _verified_asset(bucket, digest, label):
+    body = bucket.asset_get(digest)
+    if body is None:
+        raise RuntimeError(f"{label} {digest} was not found in storage")
+    if hashlib.sha256(body).hexdigest() != digest:
+        raise RuntimeError(f"{label} {digest} failed its content hash")
+    return body
+
+
+def load_world_core_module(bucket):
+    """Load this account's selected core, falling back to the shared offer."""
+    pointer, _ = bucket.kv_get(WORLD_CORE_POINTER_KEY)
+    source = WORLD_CORE_POINTER_KEY
+    if not pointer:
+        pointer, _ = bucket.get(bucket.shared_prefix + WORLD_CORE_SHARED_KEY)
+        source = f"shared {WORLD_CORE_SHARED_KEY}"
+    digest = _sha256_pointer(pointer, source)
+    body = _verified_asset(bucket, digest, "world_core.py")
+    return load_module_from_source("directionally_world_core", body.decode("utf-8"))
 
 
 def load_world_module(bucket):
@@ -142,10 +178,7 @@ def load_world_module(bucket):
     mechanism shared across accounts. Two different accounts calling this
     get two different world.py bodies; that is the point, not an edge case.
 
-    No static fallback in this image -- unlike backend's own copy of this
-    worker (tools/attested-worker/worker.py, still used by the Fly
-    attestor/lambda-executor images), this ACI packaging ships no bundled
-    world.py at all. Backend is responsible for seeding this account's
+    This runtime ships no bundled account world.py. Backend is responsible for seeding this account's
     world.py (via tools/circle/circle.py's publish/repoint) before ever
     dispatching a session here; an unset pointer, an unreadable pointer, a
     missing body, or a body that fails to even exec is this call's own
@@ -161,12 +194,8 @@ def load_world_module(bucket):
     pointer, _ = bucket.kv_get(WORLD_PY_POINTER_KEY)
     if not pointer:
         raise RuntimeError(f"no {WORLD_PY_POINTER_KEY} set for this account -- backend must seed world.py before dispatching a session")
-    sha256 = pointer.strip().lower()
-    if len(sha256) != 64 or not all(c in "0123456789abcdef" for c in sha256):
-        raise RuntimeError(f"{WORLD_PY_POINTER_KEY} is not a valid sha256 pointer: {pointer!r}")
-    body = bucket.asset_get(sha256)
-    if body is None:
-        raise RuntimeError(f"world.py body {sha256} referenced by {WORLD_PY_POINTER_KEY} was not found in storage")
+    sha256 = _sha256_pointer(pointer, WORLD_PY_POINTER_KEY)
+    body = _verified_asset(bucket, sha256, "world.py")
     return load_module_from_source("directionally_world", body.decode("utf-8"))
 
 
@@ -278,6 +307,26 @@ def build_bucket_and_kv(storage_grant, content_keys=None):
             raise RuntimeError(f"content_keys contains a malformed generation: {exc}") from exc
     bucket = storage.Bucket(None, storage_grant, content_keys=keyring)
     return bucket, _Kv(bucket, storage.Conflict)
+
+
+def force_worldcore_update(storage_grant, content_keys=None):
+    """CAS-adopt the shared world_core.py without loading the current world."""
+    bucket, kv = build_bucket_and_kv(storage_grant, content_keys or [])
+    candidate_raw, _ = bucket.get(bucket.shared_prefix + WORLD_CORE_SHARED_KEY)
+    candidate = _sha256_pointer(candidate_raw, f"shared {WORLD_CORE_SHARED_KEY}")
+    _verified_asset(bucket, candidate, "world_core.py")
+    before, exists = kv.kv_get(WORLD_CORE_POINTER_KEY)
+    if before == candidate:
+        return {"before": before, "after": candidate, "changed": False}
+    ok, current = kv.kv_set(
+        WORLD_CORE_POINTER_KEY,
+        candidate,
+        if_match=before if exists else None,
+        if_absent=not exists,
+    )
+    if not ok:
+        raise RuntimeError(f"{WORLD_CORE_POINTER_KEY} changed concurrently; now {current!r}")
+    return {"before": before, "after": candidate, "changed": True}
 
 
 def _read_frame(sock):
@@ -829,6 +878,8 @@ def handle(request):
             request["storage_grant"], request.get("content_keys") or []
         )
         _mark("build_bucket_and_kv")
+        load_world_core_module(bucket)
+        _mark("load_world_core")
         world_module = load_world_module(bucket)
         _mark("load_world_module")
         # agent.py's _issue_delegation_for_call() mints a fresh, short-lived
@@ -850,6 +901,9 @@ def handle(request):
         scope_vars = {
             "storage_grant": request["storage_grant"],
             "content_keys": request.get("content_keys") or [],
+            "force_worldcore_update": lambda: force_worldcore_update(
+                request["storage_grant"], request.get("content_keys") or []
+            ),
         }
         _mark("worldless_setup")
 

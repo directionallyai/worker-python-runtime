@@ -28,12 +28,9 @@ container can actually read what they're trusting, the same reasoning
 that already applies to `aci-worker`'s own `session_master.rs` being
 public.
 
-Canonical source still lives in backend's own
-`packages/api/assets/setup/{worker,storage}.py` too (a separate,
-private repo -- local dev/test there still imports from that copy) --
-keeping the two in sync is a real, known cost (worker.py diverged badly
-once already between two repos earlier in this project's history) and
-is open follow-up work, not something this repo solves on its own yet.
+This repository is the canonical and sole source for both files. They are
+included in `/runtime.tar.gz`, so downstream reviewer images can extract the
+exact reviewed `storage.py` without keeping a private copy.
 
 ## `runtime`
 

@@ -1,10 +1,9 @@
 name: Build and Push Worker Python Runtime
 
 # Publishes a distribution-only image (busybox:1.37.0-musl + one file,
-# /runtime.tar.gz) that backend's own repackage step pulls, extracts,
-# drops worker.py/storage.py into lib/python3.12/site-packages/, and
-# re-publishes as the single content-addressed worker_bundle -- see this
-# repo's own README and the Dockerfile's own header comment. Published
+# /runtime.tar.gz) that already contains worker.py/storage.py. Backend pulls
+# and republishes those exact bytes as the content-addressed worker bundle --
+# see this repo's README and Dockerfile header. Published
 # public: nothing in this tarball is secret (a stock CPython build plus
 # ordinary open-source wheels), and Azure needs to pull it without a
 # registry credential the same way aci-worker's own image does. GHCR
@@ -18,6 +17,11 @@ on:
     branches: [ main ]
     paths:
       - 'Dockerfile'
+      - 'worker.py'
+      - 'storage.py'
+      - 'test_*.py'
+      - 'pyproject.toml'
+      - 'uv.lock'
       - '.github/workflows/build.yml'
   workflow_dispatch: {}
 
