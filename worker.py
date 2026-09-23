@@ -22,6 +22,7 @@ Request (stdin, one JSON object):
     {
       "storage_grant": {...},   # same shape as circle.py's $DIRECTIONALLY_STORAGE
       "content_keys": [...],    # plaintext only inside the attested session
+      "model_key": "...",       # optional capped key for world.orient()
       "mode": "eval" | "repl",
       "code": "...",
       "world": true,            # optional, default true -- see handle()'s own
@@ -852,6 +853,9 @@ def handle(request):
     doesn't call time.perf_counter() at all unless profile is set.
     """
     profile = bool(request.get("profile"))
+    model_key = request.get("model_key")
+    if isinstance(model_key, str) and model_key:
+        os.environ["DIRECTIONALLY_ORIENT_OPENROUTER_KEY"] = model_key
     timings = {} if profile else None
     phase_start = time.perf_counter() if profile else None
 
