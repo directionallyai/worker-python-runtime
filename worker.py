@@ -139,6 +139,7 @@ def load_module_from_source(name, source):
 WORLD_PY_POINTER_KEY = "circle.world_py"
 WORLD_CORE_POINTER_KEY = "circle.world_core"
 WORLD_CORE_SHARED_KEY = "world_core"
+WORLD_PY_SHARED_KEY = "world_py"
 
 
 def _sha256_pointer(value, label):
@@ -327,6 +328,67 @@ def force_worldcore_update(storage_grant, content_keys=None):
     if not ok:
         raise RuntimeError(f"{WORLD_CORE_POINTER_KEY} changed concurrently; now {current!r}")
     return {"before": before, "after": candidate, "changed": True}
+
+
+def force_world_reset(storage_grant, content_keys=None):
+    """CAS-reset both account code pointers to the current shared defaults.
+
+    Only the world.py and world_core.py pointers change. Notebook entries and
+    all other account storage remain untouched. The object store cannot CAS
+    two keys atomically, so if the second pointer loses a race, restore the
+    first with its own CAS before reporting the conflict.
+    """
+    bucket, kv = build_bucket_and_kv(storage_grant, content_keys or [])
+    defaults = {}
+    for label, key in (
+        ("world_core.py", WORLD_CORE_SHARED_KEY),
+        ("world.py", WORLD_PY_SHARED_KEY),
+    ):
+        raw, _ = bucket.get(bucket.shared_prefix + key)
+        digest = _sha256_pointer(raw, f"shared {key}")
+        _verified_asset(bucket, digest, label)
+        defaults[label] = digest
+
+    pointers = (
+        ("world_core.py", WORLD_CORE_POINTER_KEY),
+        ("world.py", WORLD_PY_POINTER_KEY),
+    )
+    before = {}
+    exists = {}
+    for label, key in pointers:
+        before[label], exists[label] = kv.kv_get(key)
+        if not exists[label]:
+            raise RuntimeError(f"cannot safely reset: account pointer {key} is missing")
+
+    changed = []
+    for label, key in pointers:
+        target = defaults[label]
+        old = before[label]
+        if old == target:
+            continue
+        ok, current = kv.kv_set(key, target, if_match=old)
+        if ok:
+            changed.append((label, key, old, target))
+            continue
+
+        # Best-effort rollback of an earlier pointer update. CAS ensures we
+        # never overwrite a concurrent writer while trying to restore it.
+        rollback_failures = []
+        for changed_label, changed_key, old_value, target_value in reversed(changed):
+            restored, latest = kv.kv_set(changed_key, old_value, if_match=target_value)
+            if not restored:
+                rollback_failures.append(f"{changed_key} is now {latest!r}")
+        detail = f"{key} changed concurrently; now {current!r}"
+        if rollback_failures:
+            detail += "; partial reset remains: " + ", ".join(rollback_failures)
+        raise RuntimeError(detail)
+
+    return {
+        "world_core": {"before": before["world_core.py"], "after": defaults["world_core.py"]},
+        "world_py": {"before": before["world.py"], "after": defaults["world.py"]},
+        "changed": bool(changed),
+        "preserved": "account storage other than the two code pointers",
+    }
 
 
 def _read_frame(sock):
@@ -902,6 +964,9 @@ def handle(request):
             "storage_grant": request["storage_grant"],
             "content_keys": request.get("content_keys") or [],
             "force_worldcore_update": lambda: force_worldcore_update(
+                request["storage_grant"], request.get("content_keys") or []
+            ),
+            "force_world_reset": lambda: force_world_reset(
                 request["storage_grant"], request.get("content_keys") or []
             ),
         }
