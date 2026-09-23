@@ -416,15 +416,12 @@ def _write_frame(sock, payload):
     sock.sendall(struct.pack(">I", len(payload)) + payload)
 
 
-def make_queue_eval(
-    queue_addr, queue_token, default_storage_grant, default_pattern_delegate, default_content_keys
-):
-    """Returns a `queue_eval(code, mode="eval", storage_grant=None,
-    pattern_delegate=None)` callable -- the "tail call" primitive: code
+def make_queue_eval(queue_addr, queue_token, default_storage_grant, default_content_keys):
+    """Returns a `queue_eval(code, mode="eval", storage_grant=None)` callable -- the "tail call" primitive: code
     running inside this same sandboxed session can ask session_master.rs
     (session_master.rs's own spawn_queue_listener(), reachable over the
     container's shared network namespace on 127.0.0.1) to run one more
-    {mode, code, storage_grant, pattern_delegate} job *after* this
+    {mode, code, storage_grant} job *after* this
     session's primary response has already been sent back to the caller.
     The queued job runs inside the same attested container, still
     unprivileged/sandboxed the same way this call itself is (run via the
@@ -434,8 +431,8 @@ def make_queue_eval(
     socket (injected into this session's own request by
     run_callback_session(), never minted here) -- presenting it is what
     proves to session_master.rs that this call, not some other process,
-    is the one it handed the token to. storage_grant/pattern_delegate
-    default to this call's own (the common case: keep using the same
+    is the one it handed the token to. storage_grant defaults to this
+    call's own (the common case: keep using the same
     credential), but can be overridden per queued job.
 
     Returns a no-op-that-raises callable, not None, when this session's
@@ -445,7 +442,7 @@ def make_queue_eval(
     AttributeError somewhere unrelated.
     """
     if not queue_addr or not queue_token:
-        def _unavailable(code="", mode="eval", storage_grant=None, pattern_delegate=None, **extra):
+        def _unavailable(code="", mode="eval", storage_grant=None, **extra):
             raise RuntimeError("background eval queueing is not available for this session")
 
         return _unavailable
@@ -453,7 +450,7 @@ def make_queue_eval(
     host, _, port_str = queue_addr.rpartition(":")
     port = int(port_str)
 
-    def queue_eval(code="", mode="eval", storage_grant=None, pattern_delegate=None, **extra):
+    def queue_eval(code="", mode="eval", storage_grant=None, **extra):
         """`code`/`mode` are the ordinary eval/repl tail-call shape.
         `**extra` rides straight into the queued request untouched -- e.g.
         `mode="reviewer"` (see run_reviewer()'s own docstring) sends
@@ -468,7 +465,6 @@ def make_queue_eval(
             "mode": mode,
             "code": code,
             "storage_grant": storage_grant if storage_grant is not None else default_storage_grant,
-            "pattern_delegate": pattern_delegate if pattern_delegate is not None else default_pattern_delegate,
             "content_keys": default_content_keys,
         }
         request.update(extra)
@@ -890,7 +886,6 @@ def handle(request):
         request.get("queue_addr"),
         request.get("queue_token"),
         request["storage_grant"],
-        request.get("pattern_delegate"),
         request.get("content_keys") or [],
     )
     _mark("make_queue_eval")
@@ -944,19 +939,7 @@ def handle(request):
         _mark("load_world_core")
         world_module = load_world_module(bucket)
         _mark("load_world_module")
-        # agent.py's _issue_delegation_for_call() mints a fresh, short-lived
-        # pattern:query delegate for every eval/repl call and sends it here
-        # alongside storage_grant, purely as part of this one request -- never
-        # written anywhere durable. world.py's own PatternMatcher (running
-        # inside this sandbox, which correctly has no real CLI credential of
-        # its own to mint one with) only ever holds it for this call's
-        # lifetime. "" (World's own default) when the request carried none --
-        # a caller other than agent.py's attested_remote_eval, or one that
-        # couldn't mint one for this call -- and PatternMatcher raises on
-        # first use rather than silently doing nothing.
-        world = world_module.World(
-            kv, str(request.get("pattern_delegate") or "").strip(), queue_eval=queue_eval, local=local
-        )
+        world = world_module.World(kv, queue_eval=queue_eval, local=local)
         _mark("build_world")
         scope_vars = {"world": world}
     else:
