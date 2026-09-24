@@ -140,6 +140,8 @@ WORLD_PY_POINTER_KEY = "circle.world_py"
 WORLD_CORE_POINTER_KEY = "circle.world_core"
 WORLD_CORE_SHARED_KEY = "world_core"
 WORLD_PY_SHARED_KEY = "world_py"
+REVIEWER_BUNDLE_POINTER_KEY = "reviewer_bundle"
+REVIEWER_BUNDLE_SHARED_KEY = "reviewer_bundle"
 
 
 def _sha256_pointer(value, label):
@@ -331,18 +333,18 @@ def force_worldcore_update(storage_grant, content_keys=None):
 
 
 def force_world_reset(storage_grant, content_keys=None):
-    """CAS-reset both account code pointers to the current shared defaults.
+    """CAS-reset account world and reviewer pointers to shared defaults.
 
-    Only the world.py and world_core.py pointers change. Notebook entries and
-    all other account storage remain untouched. The object store cannot CAS
-    two keys atomically, so if the second pointer loses a race, restore the
-    first with its own CAS before reporting the conflict.
+    Notebook entries and all other account storage remain untouched. The
+    object store cannot CAS multiple keys atomically, so a conflict restores
+    earlier pointer updates with their own CAS before reporting it.
     """
     bucket, kv = build_bucket_and_kv(storage_grant, content_keys or [])
     defaults = {}
     for label, key in (
         ("world_core.py", WORLD_CORE_SHARED_KEY),
         ("world.py", WORLD_PY_SHARED_KEY),
+        ("reviewer_bundle", REVIEWER_BUNDLE_SHARED_KEY),
     ):
         raw, _ = bucket.get(bucket.shared_prefix + key)
         digest = _sha256_pointer(raw, f"shared {key}")
@@ -352,12 +354,13 @@ def force_world_reset(storage_grant, content_keys=None):
     pointers = (
         ("world_core.py", WORLD_CORE_POINTER_KEY),
         ("world.py", WORLD_PY_POINTER_KEY),
+        ("reviewer_bundle", REVIEWER_BUNDLE_POINTER_KEY),
     )
     before = {}
     exists = {}
     for label, key in pointers:
         before[label], exists[label] = kv.kv_get(key)
-        if not exists[label]:
+        if not exists[label] and label != "reviewer_bundle":
             raise RuntimeError(f"cannot safely reset: account pointer {key} is missing")
 
     changed = []
@@ -366,7 +369,7 @@ def force_world_reset(storage_grant, content_keys=None):
         old = before[label]
         if old == target:
             continue
-        ok, current = kv.kv_set(key, target, if_match=old)
+        ok, current = kv.kv_set(key, target, if_match=old if exists[label] else None, if_absent=not exists[label])
         if ok:
             changed.append((label, key, old, target))
             continue
@@ -386,8 +389,9 @@ def force_world_reset(storage_grant, content_keys=None):
     return {
         "world_core": {"before": before["world_core.py"], "after": defaults["world_core.py"]},
         "world_py": {"before": before["world.py"], "after": defaults["world.py"]},
+        "reviewer_bundle": {"before": before["reviewer_bundle"], "after": defaults["reviewer_bundle"]},
         "changed": bool(changed),
-        "preserved": "account storage other than the two code pointers",
+        "preserved": "account storage other than the two code pointers and reviewer bundle pointer",
     }
 
 

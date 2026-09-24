@@ -99,11 +99,13 @@ class WorldCoreUpdateTests(unittest.TestCase):
         )
         self.assertEqual(result, {"before": "old-core", "after": digest, "changed": True})
 
-    def test_force_reset_repoints_both_code_pointers_without_touching_other_state(self):
+    def test_force_reset_repoints_world_and_reviewer_without_touching_other_state(self):
         core = b"class WorldCore: pass\n"
         world = b"from directionally_world_core import WorldCore\nclass World(WorldCore): pass\n"
+        reviewer = b"reviewer bundle"
         core_hash = hashlib.sha256(core).hexdigest()
         world_hash = hashlib.sha256(world).hexdigest()
+        reviewer_hash = hashlib.sha256(reviewer).hexdigest()
 
         class Bucket:
             shared_prefix = "v4/all/"
@@ -112,11 +114,12 @@ class WorldCoreUpdateTests(unittest.TestCase):
                 pointers = {
                     "v4/all/world_core": core_hash.encode(),
                     "v4/all/world_py": world_hash.encode(),
+                    "v4/all/reviewer_bundle": reviewer_hash.encode(),
                 }
                 return (pointers[key], "etag")
 
             def asset_get(self, digest):
-                return {core_hash: core, world_hash: world}.get(digest)
+                return {core_hash: core, world_hash: world, reviewer_hash: reviewer}.get(digest)
 
         class Kv:
             def __init__(self):
@@ -128,9 +131,11 @@ class WorldCoreUpdateTests(unittest.TestCase):
                 return (self.values.get(key), key in self.values)
 
             def kv_set(self, key, value, if_match=None, if_absent=False):
+                if if_absent and key in self.values:
+                    return (False, self.values[key])
                 if self.values.get(key) != if_match:
                     return (False, self.values.get(key))
-                self.writes.append((key, value, if_match))
+                self.writes.append((key, value, if_match, if_absent))
                 self.values[key] = value
                 return (True, value)
 
@@ -138,33 +143,38 @@ class WorldCoreUpdateTests(unittest.TestCase):
         with mock.patch.object(worker, "build_bucket_and_kv", return_value=(bucket, kv)):
             result = worker.force_world_reset({}, [])
 
-        self.assertEqual(kv.values, {"circle.world_core": core_hash, "circle.world_py": world_hash})
+        self.assertEqual(kv.values, {"circle.world_core": core_hash, "circle.world_py": world_hash, "reviewer_bundle": reviewer_hash})
         self.assertEqual(kv.other_state, {"lab_notebook": ["keep me"]})
         self.assertEqual(
             kv.writes,
             [
-                ("circle.world_core", core_hash, "old-core"),
-                ("circle.world_py", world_hash, "old-world"),
+                ("circle.world_core", core_hash, "old-core", False),
+                ("circle.world_py", world_hash, "old-world", False),
+                ("reviewer_bundle", reviewer_hash, None, True),
             ],
         )
         self.assertTrue(result["changed"])
         self.assertEqual(result["world_core"], {"before": "old-core", "after": core_hash})
         self.assertEqual(result["world_py"], {"before": "old-world", "after": world_hash})
+        self.assertEqual(result["reviewer_bundle"], {"before": None, "after": reviewer_hash})
 
-    def test_force_reset_rolls_back_first_pointer_if_second_loses_cas(self):
+    def test_force_reset_rolls_back_world_pointers_if_reviewer_loses_cas(self):
         core = b"core"
         world = b"world"
+        reviewer = b"reviewer"
         core_hash = hashlib.sha256(core).hexdigest()
         world_hash = hashlib.sha256(world).hexdigest()
+        reviewer_hash = hashlib.sha256(reviewer).hexdigest()
 
         class Bucket:
             shared_prefix = "v4/all/"
 
             def get(self, key):
-                return ((core_hash if key.endswith("world_core") else world_hash).encode(), None)
+                pointers = {"v4/all/world_core": core_hash, "v4/all/world_py": world_hash, "v4/all/reviewer_bundle": reviewer_hash}
+                return (pointers[key].encode(), None)
 
             def asset_get(self, digest):
-                return {core_hash: core, world_hash: world}.get(digest)
+                return {core_hash: core, world_hash: world, reviewer_hash: reviewer}.get(digest)
 
         class Kv:
             def __init__(self):
@@ -172,12 +182,12 @@ class WorldCoreUpdateTests(unittest.TestCase):
                 self.cas_count = 0
 
             def kv_get(self, key):
-                return (self.values[key], True)
+                return (self.values.get(key), key in self.values)
 
             def kv_set(self, key, value, if_match=None, if_absent=False):
                 self.cas_count += 1
-                if key == "circle.world_py" and value == world_hash:
-                    self.values[key] = "concurrent-world"
+                if key == "reviewer_bundle" and value == reviewer_hash:
+                    self.values[key] = "concurrent-reviewer"
                     return (False, self.values[key])
                 if self.values[key] != if_match:
                     return (False, self.values[key])
@@ -186,10 +196,11 @@ class WorldCoreUpdateTests(unittest.TestCase):
 
         kv = Kv()
         with mock.patch.object(worker, "build_bucket_and_kv", return_value=(Bucket(), kv)):
-            with self.assertRaisesRegex(RuntimeError, "circle.world_py changed concurrently"):
+            with self.assertRaisesRegex(RuntimeError, "reviewer_bundle changed concurrently"):
                 worker.force_world_reset({}, [])
         self.assertEqual(kv.values["circle.world_core"], "old-core")
-        self.assertEqual(kv.values["circle.world_py"], "concurrent-world")
+        self.assertEqual(kv.values["circle.world_py"], "old-world")
+        self.assertEqual(kv.values["reviewer_bundle"], "concurrent-reviewer")
 
     def test_force_update_rejects_a_body_that_does_not_match_its_pointer(self):
         digest = hashlib.sha256(b"expected").hexdigest()
