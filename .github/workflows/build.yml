@@ -28,6 +28,13 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}/worker-python-runtime
+  # Fixed value, not `date +%s` at run time: BuildKit's SOURCE_DATE_EPOCH
+  # build-arg normalizes image-config `created` and layer timestamps to
+  # this instead of each run's own wall clock, which is what actually
+  # lets two builds from identical source converge on the same digest --
+  # same pin extra/build-attest-api/Dockerfile uses in
+  # directionallyai/linuxkit-attestable-ami.
+  SOURCE_DATE_EPOCH: "1788613323"
 
 jobs:
   build-and-push:
@@ -57,23 +64,37 @@ jobs:
       # step, nothing further to check here. Built locally first (not
       # pushed) purely so a build failure shows up before anything is
       # published under :dev.
+      # `outputs:` (raw buildx syntax), not the action's own `tags:`/`push:`/
+      # `load:` inputs: confirmed live, in directionallyai/github-to-private-key
+      # and directionallyai/aci-worker's own workflows, that SOURCE_DATE_EPOCH
+      # alone normalizes the image config's own `created` field but NOT
+      # individual file mtimes inside a layer -- rewrite-timestamp=true (the
+      # same option extra/build-attest-api/build-deterministic.sh's own
+      # OCI-tar export already uses in directionallyai/linuxkit-attestable-ami)
+      # fixes it, but is only reachable through this raw syntax.
       - name: Build image (local, for verification)
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: false
-          load: true
-          tags: worker-python-runtime:verify
+          provenance: false
+          sbom: false
+          build-args: |
+            SOURCE_DATE_EPOCH=${{ env.SOURCE_DATE_EPOCH }}
+          outputs: type=docker,name=worker-python-runtime:verify,rewrite-timestamp=true
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # `outputs:` name= accepts a comma-separated list for multiple tags in
+      # one push, quoted so buildx doesn't mistake the tag-list commas for
+      # the outer type=image,name=...,push=...  key separators.
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:dev
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          provenance: false
+          sbom: false
+          build-args: |
+            SOURCE_DATE_EPOCH=${{ env.SOURCE_DATE_EPOCH }}
+          outputs: 'type=image,"name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:dev,${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}",push=true,rewrite-timestamp=true'
           cache-from: type=gha
           cache-to: type=gha,mode=max
