@@ -33,17 +33,29 @@
 # worker_bundle mechanism already relies on -- so this uses that instead,
 # even though it gives up EROFS's mount-not-extract property.
 #
-# python-build-standalone (fetched via `uv python install`, the same
-# mechanism/artifacts astral's own uv uses for itself) instead of
-# Alpine's own apk python3: needs to be genuinely relocatable to an
-# arbitrary runtime path chosen by whatever extracts it
-# (/tmp/worker-runtime-<hash>, not a fixed location), which Alpine's own
-# system Python installation was never built to support -- confirmed
-# this session that a stdlib venv layered on top of a system Python is
-# NOT sufficient for this (still references the base install's
-# stdlib/libpython by absolute path); python-build-standalone's own
-# binaries carry no such reference, confirmed empirically by relocating
-# a real build to an arbitrary path and running it cold.
+# GNU/glibc target, not musl -- this was musl (matching an Alpine-based
+# aci-worker) until aci-worker's own image moved to a digest-pinned
+# Ubuntu base for reproducibility (apk has no equivalent to apt's own
+# snapshot mirrors, so a bare `apk add` always resolves against
+# Alpine's *live* package index no matter how precisely the base image
+# is pinned -- confirmed the actual, root-caused source of a real
+# reproducibility bug elsewhere in this same effort). session_master.rs's
+# own run_worker() execs this tarball's own `runtime` entry point
+# inside a bwrap sandbox built from `--ro-bind /lib /lib` (and /usr,
+# /bin) straight off aci-worker's own host image -- confirmed live,
+# this session: the musl build's own python3.12 has ELF interpreter
+# /lib/ld-musl-x86_64.so.1 and does NOT bundle it (`readelf -d` shows
+# `NEEDED libc.so` with no matching file anywhere in the extracted
+# tree), so it depended entirely on aci-worker's own image providing
+# musl's loader at that path -- true on the old Alpine aci-worker,
+# false on the new Ubuntu one. Rather than bolt a musl compatibility
+# shim onto a glibc host, this tarball's own interpreter now matches:
+# cpython-3.12.14-linux-x86_64-gnu, ELF interpreter
+# /lib64/ld-linux-x86-64.so.2 -- confirmed live that Ubuntu provides
+# this at its standard path, no shim needed, and that pip installing
+# this project's own dependencies from a glibc builder onto a
+# glibc-target interpreter is the ordinary case (manylinux wheels, not
+# musllinux) rather than the workaround the previous musl setup needed.
 #
 # uv itself fetched by a pinned version + hand-verified SHA-256 (its own
 # published .sha256 sidecar file, not just trusting whatever `latest`
@@ -51,23 +63,53 @@
 # as agent.py's own AZURE_MAA_EXPECTED_ISSUER/ACI_WORKER_BUNDLE_SHA256.
 # Pinning UV_VERSION is what actually makes the python-build-standalone
 # resolution reproducible: a given uv release embeds a fixed mapping
-# from a version string like "cpython-3.12.14-linux-x86_64-musl" to one
+# from a version string like "cpython-3.12.14-linux-x86_64-gnu" to one
 # specific python-build-standalone release tag, so pinning uv pins that
 # resolution too, without needing to separately track python-build-
 # standalone's own release tags by hand. PYTHON_SPEC's own patch version
 # still has to be bumped deliberately, same as any other dependency pin
 # in this repo.
+#
+# Ubuntu, not Alpine, for the build/verify stages too -- apt pinned to a
+# fixed snapshot.ubuntu.com date instead of the live archive, same
+# recipe extra/build-attest-api/Dockerfile already uses in
+# directionallyai/linuxkit-attestable-ami and
+# directionallyai/aci-worker's own aci/Dockerfile now uses. Whether
+# uv/pip's own network fetches (uv's release tarball, python-build-
+# standalone's release tarball, PyPI wheels) are themselves reproducible
+# is a separate question this doesn't solve -- each is pinned by an
+# exact version plus a hash check where one exists (uv, uv.lock), which
+# is the strongest guarantee available without vendoring those fetches
+# too.
+ARG SOURCE_DATE_EPOCH=1788613323
 
-FROM alpine:3.22 AS build
+FROM ubuntu:24.04@sha256:a61567bd31828687156d735ea8eb01ba4e37636e225dd6a48ba94136a70d9d61 AS base
+ARG SOURCE_DATE_EPOCH
+ENV DEBIAN_FRONTEND=noninteractive
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    snapshot="$(/bin/bash -euc "printf \"%(%Y%m%dT%H%M%SZ)T\n\" \"${SOURCE_DATE_EPOCH}\"")" && \
+    sed -i -e '/Types: deb/ a\Snapshot: true' /etc/apt/sources.list.d/ubuntu.sources && \
+    sed -i "s/archive.ubuntu.com\/ubuntu\//snapshot.ubuntu.com\/ubuntu\/${snapshot}/" /etc/apt/sources.list.d/ubuntu.sources && \
+    sed -i "s/security.ubuntu.com\/ubuntu\//snapshot.ubuntu.com\/ubuntu\/${snapshot}/" /etc/apt/sources.list.d/ubuntu.sources && \
+    rm -f /etc/apt/apt.conf.d/docker-clean && \
+    echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' >/etc/apt/apt.conf.d/keep-cache && \
+    apt-get install --update -o Acquire::Check-Valid-Until=false -o Acquire::https::Verify-Peer=false -y \
+      ca-certificates curl && \
+    rm -rf /var/log/* /var/cache/ldconfig/aux-cache
 
-RUN apk add --no-cache curl ca-certificates
+# ---------------------------------------------------------------------------
+# build stage
+# ---------------------------------------------------------------------------
+FROM base AS build
+ARG SOURCE_DATE_EPOCH
 
 ARG UV_VERSION=0.12.15
-ARG UV_SHA256=999c0c3da986953e508985c3932d283d2c62eb167b4f8d81e79f565e34104959
-ARG PYTHON_SPEC=cpython-3.12.14-linux-x86_64-musl
+ARG UV_SHA256=f97935763c04be3e692460a7aaeaaab8fc3b78fcf8b389da820b38ae7423a638
+ARG PYTHON_SPEC=cpython-3.12.14-linux-x86_64-gnu
 
 RUN curl -fsSL -o /tmp/uv.tar.gz \
-      "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-musl.tar.gz" \
+      "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-gnu.tar.gz" \
     && echo "${UV_SHA256}  /tmp/uv.tar.gz" | sha256sum -c - \
     && mkdir -p /tmp/uv-extracted \
     && tar -C /tmp/uv-extracted -xzf /tmp/uv.tar.gz \
@@ -104,9 +146,9 @@ RUN rm -rf \
 # pins as aci-worker's own Dockerfile used to carry when these were
 # baked into the base image instead of shipped here. cryptography's own
 # compiled extension (cffi/_cffi_backend) needs installing natively on
-# this musl builder -- confirmed the hard way that pip refuses a
-# musllinux-tagged wheel from a glibc host without forcing the platform
-# tags, which building natively here avoids needing at all.
+# this glibc builder, same reasoning the previous musl setup already
+# followed for musllinux wheels -- installing from a glibc builder onto
+# a glibc-target interpreter picks up ordinary manylinux wheels instead.
 #
 # `uv export` resolves pyproject.toml's own 5 direct pins against
 # uv.lock -- the lock is what actually pins the transitive dependencies
@@ -146,7 +188,22 @@ RUN printf '%s\n' \
       > /build/runtime/runtime \
     && chmod 0755 /build/runtime/runtime
 
-RUN tar -C /build -czf /runtime.tar.gz runtime
+# Reproducibility: this tarball's own bytes are a separate concern from
+# the OCI layer wrapping it -- BuildKit's rewrite-timestamp (image
+# export) only normalizes the outer layer's own tar/timestamps, not the
+# content of a file that happens to itself be a tar.gz being copied
+# into that layer. Confirmed live, this session: without the flags
+# below, two --no-cache builds of identical source produced different
+# runtime.tar.gz bytes (differing layer digest AND size), because plain
+# `tar -czf` records each file's real on-disk mtime (which varies
+# build-to-build -- when pip wrote a wheel's files, when uv extracted
+# the interpreter, etc.) and directory read order (not guaranteed
+# stable across separate builds), and gzip's own header embeds a
+# modification timestamp by default. --mtime/--sort fix the first two;
+# `gzip -n` (no name/timestamp in the gzip header, piped in rather than
+# tar's own -z) fixes the third.
+RUN tar --sort=name --mtime="@${SOURCE_DATE_EPOCH}" --owner=0 --group=0 --numeric-owner \
+      -C /build -cf - runtime | gzip -n > /runtime.tar.gz
 
 # ---------------------------------------------------------------------------
 # verify stage: prove the tarball actually extracts and runs correctly,
@@ -155,7 +212,7 @@ RUN tar -C /build -czf /runtime.tar.gz runtime
 # 10001) -- mirrors backend's own tools/reviewer-agent/Dockerfile verify
 # stage.
 # ---------------------------------------------------------------------------
-FROM alpine:3.22 AS verify
+FROM base AS verify
 COPY --from=build /runtime.tar.gz /runtime.tar.gz
 RUN mkdir -p /extracted \
     && tar -C /extracted -xzf /runtime.tar.gz \
@@ -173,8 +230,9 @@ RUN output="$(echo -n '' | /extracted/runtime/runtime 2>&1)"; ec=$?; echo "$outp
     && [ "$ec" -ne 0 ] \
     && echo "$output" | grep -q "json.decoder.JSONDecodeError" \
     && echo "runtime entry point OK (worker.main() reached real stdin parsing)"
-RUN addgroup -S -g 10001 worker \
-    && adduser -S -D -H -s /sbin/nologin -u 10001 -G worker worker
+RUN groupadd --system --gid 10001 worker \
+    && useradd --system --no-create-home --no-user-group \
+         --gid worker --shell /usr/sbin/nologin --uid 10001 worker
 USER 10001:10001
 RUN /extracted/runtime/bin/python3.12 -c "print('unprivileged run OK')" \
     && output="$(echo -n '' | /extracted/runtime/runtime 2>&1)"; ec=$?; echo "$output" \
@@ -187,6 +245,12 @@ RUN /extracted/runtime/bin/python3.12 -c "print('unprivileged run OK')" \
 # (tools/reviewer-agent/Dockerfile, a separate private repo) -- pullers
 # need retrieve one known file; none of the builder image, package
 # indexes, or the verify stage's own extracted tree survive here.
+# Nothing in this stage is ever executed (backend republishes
+# /runtime.tar.gz's own bytes by content hash, never runs this image),
+# so unlike the build/verify stages above, this base's own libc family
+# is not a correctness constraint -- kept as musl/busybox, just pinned
+# by digest for the same reproducibility reason every other base image
+# in this file is.
 # ---------------------------------------------------------------------------
-FROM busybox:1.37.0-musl
+FROM busybox:1.37.0-musl@sha256:5cec3fc171c87218698e85a52af7087de727372aae264a787b8112901a5b0092
 COPY --from=verify /runtime.tar.gz /runtime.tar.gz
