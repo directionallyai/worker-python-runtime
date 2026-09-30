@@ -171,7 +171,15 @@ RUN uv export --project /tmp/lockfile --frozen --no-hashes --no-emit-project \
 # worker.py imports storage.py directly (`import storage`) -- both have
 # to land in the same importable location, already on sys.path, no
 # PYTHONPATH wiring needed by session_master.rs's own run_worker().
-COPY worker.py storage.py /build/runtime/lib/python3.12/site-packages/
+# --chmod=0644, not whatever mode git's own checkout happens to produce:
+# COPY preserves the build context's own source file permissions
+# verbatim, and those permissions depend on the checking-out
+# environment's umask (git itself only tracks executable vs not, not
+# exact mode bits) -- confirmed live, this session, that a local clone
+# under umask 0002 checks these out as 664 while GitHub Actions'
+# checkout produces 644, which was still enough to make two otherwise
+# byte-identical runtime.tar.gz builds diverge.
+COPY --chmod=0644 worker.py storage.py /build/runtime/lib/python3.12/site-packages/
 
 # The one stable entry point session_master.rs's own run_worker() execs
 # -- a script, not a bare symlink to bin/python3.12, so callers never
